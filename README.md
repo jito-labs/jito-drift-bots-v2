@@ -12,48 +12,34 @@
 
 # Setting up
 
-
-This repo has two main branches:
-
-* `master`: bleeding edge, may be unstable, currently running on the `devnet` cluster
-* `mainnet-beta`: stable, currently running on the `mainnet-beta` cluster
-
-## Setup Environment
-
-### yaml Config file:
-
-A `.yaml` file can be used to configure the bot setup now. See `config.example.yaml` for a commented example.
-
-Then you can run the bot by loading the config file:
 ```shell
 yarn run dev --config-file=example.config.yaml
 ```
 
 Here is a table defining the various fields and their usage/defaults:
 
-| Field             | Type   | Description | Default |
-| ----------------- | ------ | --- | --- |
-| global            | object | global configs to apply to all running bots | - |
-| global.endpoint   | string | RPC endpoint to use | - |
-| global.wsEndpoint | string | (optional) Websocket endpoint to use | derived from `global.endpoint` |
-| global.keeperPrivateKey  | string | (optional) The private key to use to pay/sign transactions | `KEEPER_PRIVATE_KEY` environment variable |
-| global.initUser   | bool   | Set `true` to init a fresh userAccount | `false` |
-| global.websocket  | bool   | Set `true` to run the selected bots in websocket mode if compatible| `false` |
-| global.runOnce    | bool   | Set `true` to run only one iteration of the selected bots | `false` |
-| global.debug      | bool   | Set `true` to enable debug logging | `false` |
-| global.subaccounts | list  | (optional) Which subaccount IDs to load | `0` |
-| enabledBots       | list   | list of bots to enable, matching configs must be present under `botConfigs` | - |
-| botConfigs        | object | configs for associated bots | - |
-| botConfigs.<bot_type> | object | config for a specific <bot_type> | - |
-
+| Field                   | Type   | Description                                                                 | Default                                   |
+| ----------------------- | ------ | --------------------------------------------------------------------------- | ----------------------------------------- |
+| global                  | object | global configs to apply to all running bots                                 | -                                         |
+| global.endpoint         | string | RPC endpoint to use                                                         | -                                         |
+| global.wsEndpoint       | string | (optional) Websocket endpoint to use                                        | derived from `global.endpoint`            |
+| global.keeperPrivateKey | string | (optional) The private key to use to pay/sign transactions                  | `KEEPER_PRIVATE_KEY` environment variable |
+| global.initUser         | bool   | Set `true` to init a fresh userAccount                                      | `false`                                   |
+| global.websocket        | bool   | Set `true` to run the selected bots in websocket mode if compatible         | `false`                                   |
+| global.runOnce          | bool   | Set `true` to run only one iteration of the selected bots                   | `false`                                   |
+| global.debug            | bool   | Set `true` to enable debug logging                                          | `false`                                   |
+| global.subaccounts      | list   | (optional) Which subaccount IDs to load                                     | `0`                                       |
+| enabledBots             | list   | list of bots to enable, matching configs must be present under `botConfigs` | -                                         |
+| botConfigs              | object | configs for associated bots                                                 | -                                         |
+| botConfigs.<bot_type>   | object | config for a specific <bot_type>                                            | -                                         |
 
 ### Install dependencies
 
 Run from repo root to install npm dependencies:
+
 ```shell
 yarn
 ```
-
 
 ## Initialize User
 
@@ -79,13 +65,31 @@ Alternatively, you can put the private key into a browser wallet and use the UI 
 
 # Run Bots
 
+<<<<<<< HEAD
 After creating your `config.yaml` file as above, run with:
-  
+
+=======
+
+## Run Filler Bot
+
+> > > > > > > 9329dc6 (Jito liquidator first pass)
+
 ```shell
 yarn run dev --config-file=config.yaml
 ```
 
+<<<<<<< HEAD
 By default, some [Prometheus](https://prometheus.io/) metrics are exposed on `localhost:9464/metrics`.
+=======
+
+## Run Trigger Bot
+
+```shell
+yarn
+yarn run dev:filler
+```
+
+> > > > > > > 9329dc6 (Jito liquidator first pass)
 
 # Notes on some bots
 
@@ -95,9 +99,8 @@ Read the docs: https://docs.drift.trade/just-in-time-jit-auctions
 
 ⚠ requires collateral
 
+<<<<<<< HEAD
 This is mainly to show how to participate in JIT auctions (you dont want to run this as is).
-
-
 
 ## Liquidator Bot
 
@@ -115,6 +118,16 @@ from subaccount to list of market indicies. The value of these 2 fields
 are json strings:
 
 i.e.
+
 ```
 ''
 ```
+
+=======
+
+```shell
+yarn
+yarn run dev:jitmaker
+```
+
+> > > > > > > 9329dc6 (Jito liquidator first pass)
