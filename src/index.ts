@@ -65,7 +65,7 @@ import {
 import { getPythProgramKeyForCluster } from '@pythnetwork/client';
 import { encode } from 'bs58';
 import { deserialize } from 'borsh';
-import { Bundle } from 'jito-ts/dist/sdk/types';
+import { Bundle } from 'jito-ts/dist/sdk/block-engine/types';
 
 require('dotenv').config();
 const commitHash = process.env.COMMIT;
@@ -659,7 +659,7 @@ const runBot = async () => {
 
 	const _accounts = process.env.ACCOUNTS_OF_INTEREST || '';
 	logger.info(`ACCOUNTS_OF_INTEREST: ${_accounts}`);
-	const accounts = _accounts.split(',');
+	const accounts = _accounts.split(',').map((acc) => new PublicKey(acc));
 
 	const c = searcherClient(blockEngineUrl, keypair);
 
@@ -696,7 +696,7 @@ class UpdatePrice extends Assignable {}
 
 export const onPendingTransactions = async (
 	c: SearcherClient,
-	oracleAccounts: string[],
+	oracleAccounts: PublicKey[],
 	bundleTransactionLimit: number,
 	keypair: Keypair,
 	conn: Connection,
@@ -707,7 +707,7 @@ export const onPendingTransactions = async (
 	// init drift client
 
 	/// Pyth oracle updates from Jito Mempool
-	c.onPendingTransactions(
+	c.onAccountUpdate(
 		oracleAccounts,
 		async (transactions: Transaction[]) => {
 			const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
@@ -743,7 +743,7 @@ export const onPendingTransactions = async (
 				const filteredInstructions = tx.instructions.filter((instruction) => {
 					if (
 						!instruction.programId.equals(pythProgramId) ||
-						!oracleAccounts.includes(instruction.keys[1].pubkey.toString())
+						!oracleAccounts.includes(instruction.keys[1].pubkey) // Watch out for this line - comparison between pubkeys is weird
 					) {
 						return false;
 					}
@@ -781,6 +781,9 @@ export const onPendingTransactions = async (
 								oraclePubkey,
 								newPriceAsBN
 							);
+							if (bundleTxs.length > 0) {
+								bundleTxs.unshift(tx);
+							}
 							return bundleTxs;
 						} catch (e) {
 							console.log(e);
@@ -790,22 +793,29 @@ export const onPendingTransactions = async (
 
 				const bundles = await Promise.all(bundlePromises);
 				for (const bundleTxs of bundles) {
-					for (const tx of bundleTxs) {
-						tx.recentBlockhash = blockhash;
-					}
 					if (bundleTxs.length == 0) {
 						continue;
 					}
+					for (const bundleTx of bundleTxs) {
+						bundleTx.recentBlockhash = blockhash;
+						if (bundleTx.signature === null) {
+							// Sets fee payer as well
+							bundleTx.sign({
+								publicKey: keypair.publicKey,
+								secretKey: keypair.secretKey,
+							});
+						}
+					}
 					const sigBuffer =
 						tx.signature === null ? Buffer.from('') : tx.signature;
-					logger.debug(`backrunning tx ${encode(sigBuffer)}`);
+					logger.info(`backrunning tx ${encode(sigBuffer)}`);
 					const b = new Bundle(bundleTxs, bundleTransactionLimit);
 					b.attachTip(
 						keypair,
 						100_000_000,
 						tipAccount,
 						blockhash,
-						1_000_000_000_000 // delete this, make optional
+						1_000_000_000_000 // delete this, make optional?
 					);
 					c.sendBundle(b);
 				}
@@ -821,13 +831,13 @@ export const onPendingTransactions = async (
 	}
 };
 
-export const onBundleResult = (c: SearcherClient) => {
+export const onBundleResult = (c: SearcherClient): void => {
 	c.onBundleResult(
 		(result) => {
 			logger.info(`received bundle result: ${result}`);
 		},
 		(e) => {
-			throw e;
+			logger.error(`${e}`);
 		}
 	);
 };
