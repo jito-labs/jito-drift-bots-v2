@@ -648,17 +648,17 @@ const runBot = async () => {
 	logger.info(`starting liquidator bot`);
 
 	const blockEngineUrl = process.env.BLOCK_ENGINE_URL || '';
-	logger.info('BLOCK_ENGINE_URL:', blockEngineUrl);
+	logger.info(`BLOCK_ENGINE_URL: ${blockEngineUrl}`);
 
 	const authKeypairPath = process.env.AUTH_KEYPAIR_PATH || '';
-	logger.info('AUTH_KEYPAIR_PATH:', authKeypairPath);
+	logger.info(`AUTH_KEYPAIR_PATH: ${authKeypairPath}`);
 	const decodedKey = new Uint8Array(
 		JSON.parse(Fs.readFileSync(authKeypairPath).toString()) as number[]
 	);
 	const keypair = Keypair.fromSecretKey(decodedKey);
 
 	const _accounts = process.env.ACCOUNTS_OF_INTEREST || '';
-	logger.info('ACCOUNTS_OF_INTEREST:', _accounts);
+	logger.info(`ACCOUNTS_OF_INTEREST: ${_accounts}`);
 	const accounts = _accounts.split(',');
 
 	const c = searcherClient(blockEngineUrl, keypair);
@@ -798,7 +798,7 @@ export const onPendingTransactions = async (
 					}
 					const sigBuffer =
 						tx.signature === null ? Buffer.from('') : tx.signature;
-					logger.debug('backrunning tx ', encode(sigBuffer));
+					logger.debug(`backrunning tx ${encode(sigBuffer)}`);
 					const b = new Bundle(bundleTxs, bundleTransactionLimit);
 					b.attachTip(
 						keypair,
@@ -824,7 +824,7 @@ export const onPendingTransactions = async (
 export const onBundleResult = (c: SearcherClient) => {
 	c.onBundleResult(
 		(result) => {
-			logger.info('received bundle result:', result);
+			logger.info(`received bundle result: ${result}`);
 		},
 		(e) => {
 			throw e;
