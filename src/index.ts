@@ -830,7 +830,7 @@ export const onPendingTransactions = async (
 		);
 	} catch (e) {
 		logger.info(`error: ${e}`);
-		onPendingTransactions(
+		await onPendingTransactions(
 			client,
 			oracleAccounts,
 			bundleTransactionLimit,
