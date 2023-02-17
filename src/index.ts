@@ -695,139 +695,149 @@ class Assignable {
 class UpdatePrice extends Assignable {}
 
 export const onPendingTransactions = async (
-	c: SearcherClient,
+	client: SearcherClient,
 	oracleAccounts: PublicKey[],
 	bundleTransactionLimit: number,
 	keypair: Keypair,
 	conn: Connection,
 	liquidatorBot: LiquidatorBot
 ): Promise<void> => {
-	const _tipAccount = (await c.getTipAccounts())[Math.floor(Math.random() * 9)]; // make this rng
+	const _tipAccount = (await client.getTipAccounts())[
+		Math.floor(Math.random() * 9)
+	];
 	const tipAccount = new PublicKey(_tipAccount);
 	// init drift client
 
 	/// Pyth oracle updates from Jito Mempool
-	c.onAccountUpdate(
-		oracleAccounts,
-		async (transactions: Transaction[]) => {
-			const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
+	try {
+		client.onAccountUpdate(
+			oracleAccounts,
+			async (transactions: Transaction[]) => {
+				const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
 
-			// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L148 UpdPriceArgs
-			const updatePriceSchema = new Map([
-				[
-					UpdatePrice,
-					{
-						kind: 'struct',
-						fields: [
-							['version', 'u32'],
-							['command', [4]], // i32
-							['status', 'u32'],
-							['unused', 'u32'],
-							['price', [8]], // i64
-							['confidence', 'u64'],
-							['publishing_slot', 'u64'],
-						],
-					},
-				],
-			]);
+				// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L148 UpdPriceArgs
+				const updatePriceSchema = new Map([
+					[
+						UpdatePrice,
+						{
+							kind: 'struct',
+							fields: [
+								['version', 'u32'],
+								['command', [4]], // i32
+								['status', 'u32'],
+								['unused', 'u32'],
+								['price', [8]], // i64
+								['confidence', 'u64'],
+								['publishing_slot', 'u64'],
+							],
+						},
+					],
+				]);
 
-			for (const tx of transactions) {
-				let blockhash: string;
-				try {
-					const resp = await conn.getRecentBlockhash('processed');
-					blockhash = resp.blockhash;
-				} catch {
-					return;
-				}
-
-				const filteredInstructions = tx.instructions.filter((instruction) => {
-					if (
-						!instruction.programId.equals(pythProgramId) ||
-						!oracleAccounts.includes(instruction.keys[1].pubkey) // Watch out for this line - comparison between pubkeys is weird
-					) {
-						return false;
-					}
-					let instructionArgs: any;
+				for (const tx of transactions) {
+					let blockhash: string;
 					try {
-						instructionArgs = deserialize(
-							updatePriceSchema,
-							UpdatePrice,
-							instruction.data
-						);
-					} catch (error) {
-						// wrong instruction data format, skip
-						return false;
+						const resp = await conn.getRecentBlockhash('processed');
+						blockhash = resp.blockhash;
+					} catch {
+						return;
 					}
-					const command = convertToI32(instructionArgs.command);
-					// Only evaluate UpdPrice and UpdPriceNoError ix's
-					// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L22 OracleCommand
-					return command == 3 || command == 13;
-				});
 
-				const bundlePromises: Promise<Transaction[]>[] =
-					filteredInstructions.map(async (instruction) => {
-						const instructionArgs: any = deserialize(
-							updatePriceSchema,
-							UpdatePrice,
-							instruction.data
-						);
-						const newPrice = convertToI64(instructionArgs.price);
-						const newPriceAsBN = new BN(newPrice.toString()).div(new BN(100));
-
-						const oraclePubkey = instruction.keys[1].pubkey;
-
-						try {
-							const bundleTxs = await liquidatorBot.tryLiquidate(
-								oraclePubkey,
-								newPriceAsBN
-							);
-							if (bundleTxs.length > 0) {
-								bundleTxs.unshift(tx);
-							}
-							return bundleTxs;
-						} catch (e) {
-							console.log(e);
-							return [];
+					const filteredInstructions = tx.instructions.filter((instruction) => {
+						if (
+							!instruction.programId.equals(pythProgramId) ||
+							!oracleAccounts.includes(instruction.keys[1].pubkey) // Watch out for this line - comparison between pubkeys is weird
+						) {
+							return false;
 						}
+						let instructionArgs: any;
+						try {
+							instructionArgs = deserialize(
+								updatePriceSchema,
+								UpdatePrice,
+								instruction.data
+							);
+						} catch (error) {
+							// wrong instruction data format, skip
+							return false;
+						}
+						const command = convertToI32(instructionArgs.command);
+						// Only evaluate UpdPrice and UpdPriceNoError ix's
+						// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L22 OracleCommand
+						return command == 3 || command == 13;
 					});
 
-				const bundles = await Promise.all(bundlePromises);
-				for (const bundleTxs of bundles) {
-					if (bundleTxs.length == 0) {
-						continue;
-					}
-					for (const bundleTx of bundleTxs) {
-						bundleTx.recentBlockhash = blockhash;
-						if (bundleTx.signature === null) {
-							// Sets fee payer as well
-							bundleTx.sign({
-								publicKey: keypair.publicKey,
-								secretKey: keypair.secretKey,
-							});
-						}
-					}
-					const sigBuffer =
-						tx.signature === null ? Buffer.from('') : tx.signature;
-					logger.info(`backrunning tx ${encode(sigBuffer)}`);
-					const b = new Bundle(bundleTxs, bundleTransactionLimit);
-					b.attachTip(
-						keypair,
-						100_000_000,
-						tipAccount,
-						blockhash,
-						1_000_000_000_000 // delete this, make optional?
-					);
-					c.sendBundle(b);
-				}
-			}
-		},
-		(e: Error) => {
-			throw e;
-		}
-	);
+					const bundlePromises: Promise<Transaction[]>[] =
+						filteredInstructions.map(async (instruction) => {
+							const instructionArgs: any = deserialize(
+								updatePriceSchema,
+								UpdatePrice,
+								instruction.data
+							);
+							const newPrice = convertToI64(instructionArgs.price);
+							const newPriceAsBN = new BN(newPrice.toString()).div(new BN(100));
 
-	if (config.global.runOnce) {
-		process.exit(0);
+							const oraclePubkey = instruction.keys[1].pubkey;
+
+							try {
+								const bundleTxs = await liquidatorBot.tryLiquidate(
+									oraclePubkey,
+									newPriceAsBN
+								);
+								if (bundleTxs.length > 0) {
+									bundleTxs.unshift(tx);
+								}
+								return bundleTxs;
+							} catch (e) {
+								console.log(e);
+								return [];
+							}
+						});
+
+					const bundles = await Promise.all(bundlePromises);
+					for (const bundleTxs of bundles) {
+						if (bundleTxs.length == 0) {
+							continue;
+						}
+						for (const bundleTx of bundleTxs) {
+							bundleTx.recentBlockhash = blockhash;
+							if (bundleTx.signature === null) {
+								// Sets fee payer as well
+								bundleTx.sign({
+									publicKey: keypair.publicKey,
+									secretKey: keypair.secretKey,
+								});
+							}
+						}
+						const sigBuffer =
+							tx.signature === null ? Buffer.from('') : tx.signature;
+						logger.info(`backrunning tx ${encode(sigBuffer)}`);
+						const b = new Bundle(bundleTxs, bundleTransactionLimit);
+						b.attachTip(
+							keypair,
+							100_000_000,
+							tipAccount,
+							blockhash,
+							1_000_000_000_000 // delete this, make optional?
+						);
+						client.sendBundle(b);
+					}
+				}
+			},
+			(e: Error) => {
+				throw e;
+			}
+		);
+	} catch (e) {
+		logger.info(`error: ${e}`);
+		onPendingTransactions(
+			client,
+			oracleAccounts,
+			bundleTransactionLimit,
+			keypair,
+			conn,
+			liquidatorBot
+		);
 	}
 };
 
