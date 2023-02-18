@@ -710,6 +710,7 @@ export const onPendingTransactions = async (
 
 	/// Pyth oracle updates from Jito Mempool
 	try {
+		logger.info('Listening for pyth account updates');
 		client.onAccountUpdate(
 			oracleAccounts,
 			async (transactions: Transaction[]) => {
