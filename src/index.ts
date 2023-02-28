@@ -1,14 +1,12 @@
 import fs from 'fs';
 import { program, Option } from 'commander';
 import * as http from 'http';
+import * as Fs from 'fs';
 
 import {
 	SearcherClient,
 	searcherClient,
 } from 'jito-ts/dist/sdk/block-engine/searcher';
-
-
-import * as Fs from 'fs';
 
 import {
 	Connection,
@@ -16,6 +14,8 @@ import {
 	Keypair,
 	PublicKey,
 	Transaction,
+	VersionedTransaction,
+	TransactionMessage,
 } from '@solana/web3.js';
 import {
 	Token,
@@ -702,49 +702,58 @@ export const onPendingTransactions = async (
 	conn: Connection,
 	liquidatorBot: LiquidatorBot
 ): Promise<void> => {
-	const _tipAccount = (await client.getTipAccounts())[
-		Math.floor(Math.random() * 9)
-	];
-	const tipAccount = new PublicKey(_tipAccount);
 	// init drift client
 
 	/// Pyth oracle updates from Jito Mempool
 	try {
-		logger.info('Listening for pyth account updates');
-		client.onAccountUpdate(
-			oracleAccounts,
-			async (transactions: Transaction[]) => {
-				const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
-
-				// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L148 UpdPriceArgs
-				const updatePriceSchema = new Map([
-					[
-						UpdatePrice,
-						{
-							kind: 'struct',
-							fields: [
-								['version', 'u32'],
-								['command', [4]], // i32
-								['status', 'u32'],
-								['unused', 'u32'],
-								['price', [8]], // i64
-								['confidence', 'u64'],
-								['publishing_slot', 'u64'],
-							],
-						},
+		const _tipAccount = (await client.getTipAccounts())[
+			Math.floor(Math.random() * 9)
+		];
+		const tipAccount = new PublicKey(_tipAccount);
+		const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
+		// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L148 UpdPriceArgs
+		const updatePriceSchema = new Map([
+			[
+				UpdatePrice,
+				{
+					kind: 'struct',
+					fields: [
+						['version', 'u32'],
+						['command', [4]], // i32
+						['status', 'u32'],
+						['unused', 'u32'],
+						['price', [8]], // i64
+						['confidence', 'u64'],
+						['publishing_slot', 'u64'],
 					],
-				]);
+				},
+			],
+		]);
+		logger.info('Listening for pyth account updates');
+		for await (const txs of client.accountUpdates(
+			oracleAccounts,
+			(e: Error) => {
+				throw e;
+			}
+		)) {
+			for (const tx of txs) {
+				let blockhash: string;
+				try {
+					const resp = await conn.getLatestBlockhash('processed');
+					blockhash = resp.blockhash;
+				} catch {
+					return;
+				}
 
-				for (const tx of transactions) {
-					let blockhash: string;
-					try {
-						const resp = await conn.getRecentBlockhash('processed');
-						blockhash = resp.blockhash;
-					} catch {
-						return;
-					}
+				if (tx.version == 0) {
+					logger.info(
+						'Skipping transaction version 0, not expected for pyth updates'
+					);
+				}
 
-					const filteredInstructions = tx.instructions.filter((instruction) => {
+				const decompiledMessage = TransactionMessage.decompile(tx.message);
+				const filteredInstructions = decompiledMessage.instructions.filter(
+					(instruction) => {
 						if (
 							!instruction.programId.equals(pythProgramId) ||
 							!oracleAccounts.includes(instruction.keys[1].pubkey) // Watch out for this line - comparison between pubkeys is weird
@@ -766,69 +775,65 @@ export const onPendingTransactions = async (
 						// Only evaluate UpdPrice and UpdPriceNoError ix's
 						// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L22 OracleCommand
 						return command == 3 || command == 13;
+					}
+				);
+
+				const bundlePromises: Promise<Transaction[]>[] =
+					filteredInstructions.map(async (instruction) => {
+						const instructionArgs: any = deserialize(
+							updatePriceSchema,
+							UpdatePrice,
+							instruction.data
+						);
+						const newPrice = convertToI64(instructionArgs.price);
+						const newPriceAsBN = new BN(newPrice.toString()).div(new BN(100));
+
+						const oraclePubkey = instruction.keys[1].pubkey;
+
+						try {
+							const bundleTxs = await liquidatorBot.tryLiquidate(
+								oraclePubkey,
+								newPriceAsBN
+							);
+
+							return bundleTxs;
+						} catch (e) {
+							console.log(e);
+							return [];
+						}
 					});
 
-					const bundlePromises: Promise<Transaction[]>[] =
-						filteredInstructions.map(async (instruction) => {
-							const instructionArgs: any = deserialize(
-								updatePriceSchema,
-								UpdatePrice,
-								instruction.data
-							);
-							const newPrice = convertToI64(instructionArgs.price);
-							const newPriceAsBN = new BN(newPrice.toString()).div(new BN(100));
-
-							const oraclePubkey = instruction.keys[1].pubkey;
-
-							try {
-								const bundleTxs = await liquidatorBot.tryLiquidate(
-									oraclePubkey,
-									newPriceAsBN
-								);
-								if (bundleTxs.length > 0) {
-									bundleTxs.unshift(tx);
-								}
-								return bundleTxs;
-							} catch (e) {
-								console.log(e);
-								return [];
-							}
-						});
-
-					const bundles = await Promise.all(bundlePromises);
-					for (const bundleTxs of bundles) {
-						if (bundleTxs.length == 0) {
-							continue;
-						}
-						for (const bundleTx of bundleTxs) {
-							bundleTx.recentBlockhash = blockhash;
-							if (bundleTx.signature === null) {
-								// Sets fee payer as well
-								bundleTx.sign({
-									publicKey: keypair.publicKey,
-									secretKey: keypair.secretKey,
-								});
-							}
-						}
-						const sigBuffer =
-							tx.signature === null ? Buffer.from('') : tx.signature;
-						logger.info(`backrunning tx ${encode(sigBuffer)}`);
-						const b = new Bundle(bundleTxs, bundleTransactionLimit);
-						b.attachTip(
-							keypair,
-							100_000_000,
-							tipAccount,
-							blockhash,
-							1_000_000_000_000 // delete this, make optional?
-						);
-						client.sendBundle(b);
+				const bundles = await Promise.all(bundlePromises);
+				for (const bundleTxs of bundles) {
+					if (bundleTxs.length == 0) {
+						continue;
 					}
+					for (const bundleTx of bundleTxs) {
+						bundleTx.recentBlockhash = blockhash;
+						if (bundleTx.signature === null) {
+							// Sets fee payer as well
+							bundleTx.sign({
+								publicKey: keypair.publicKey,
+								secretKey: keypair.secretKey,
+							});
+						}
+					}
+					const sigBuffer =
+						tx.signatures[0] === null ? Buffer.from('') : tx.signatures[0];
+					logger.info(`backrunning tx ${encode(sigBuffer)}`);
+					const versionedBundleTxs = bundleTxs.map((bundleTx) => {
+						return new VersionedTransaction(
+							bundleTx.compileMessage(),
+							bundleTx.signatures.map((sig) => sig.signature)
+						);
+					});
+					versionedBundleTxs.unshift(tx);
+					const b = new Bundle(versionedBundleTxs, bundleTransactionLimit);
+					b.addTipTx(keypair, 100_000_000, tipAccount, blockhash);
+					client.sendBundle(b);
 				}
-			},
-			(e: Error) => {
-				throw e;
 			}
-		);
+		}
 	} catch (e) {
 		logger.info(`error: ${e}`);
 		await onPendingTransactions(
