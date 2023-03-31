@@ -1,13 +1,22 @@
 import fs from 'fs';
 import { program, Option } from 'commander';
 import * as http from 'http';
+import * as Fs from 'fs';
 
-import { Connection, Commitment, Keypair, PublicKey } from '@solana/web3.js';
 import {
 	SearcherClient,
 	searcherClient,
 } from 'jito-ts/dist/sdk/block-engine/searcher';
 
+import {
+	Connection,
+	Commitment,
+	Keypair,
+	PublicKey,
+	Transaction,
+	VersionedTransaction,
+	TransactionMessage,
+} from '@solana/web3.js';
 import {
 	Token,
 	TOKEN_PROGRAM_ID,
@@ -30,8 +39,6 @@ import {
 	DriftClientSubscriptionConfig,
 	LogProviderConfig,
 } from '@drift-labs/sdk';
-import { promiseTimeout } from '@drift-labs/sdk/lib/util/promiseTimeout';
-import { Mutex } from 'async-mutex';
 
 import { logger, setLogLevel } from './logger';
 import { constants } from './types';
@@ -55,6 +62,10 @@ import {
 	loadConfigFromFile,
 	loadConfigFromOpts,
 } from './config';
+import { getPythProgramKeyForCluster } from '@pythnetwork/client';
+import { encode } from 'bs58';
+import { deserialize } from 'borsh';
+import { Bundle } from 'jito-ts/dist/sdk/block-engine/types';
 
 require('dotenv').config();
 const commitHash = process.env.COMMIT;
@@ -158,6 +169,33 @@ logger.info(
 
 // @ts-ignore
 const sdkConfig = initialize({ env: config.global.driftEnv });
+console.log(opts);
+setLogLevel(opts.debug ? 'debug' : 'info');
+
+logger.info(`Dry run: ${!!opts.dry},\n\
+FillerBot enabled: ${!!opts.filler},\n\
+SpotFillerBot enabled: ${!!opts.spotFiller},\n\
+TriggerBot enabled: ${!!opts.trigger},\n\
+JitMakerBot enabled: ${!!opts.jitMaker},\n\
+IFRevenueSettler enabled: ${!!opts.ifRevenueSettler},\n\
+userPnlSettler enabled: ${!!opts.userPnlSettler},\n\
+`);
+
+logger.info(
+	`Bot config:\n${JSON.stringify(
+		config,
+		(k, v) => {
+			if (k === 'keeperPrivateKey') {
+				return '*'.repeat(v.length);
+			}
+			return v;
+		},
+		2
+	)}`
+);
+
+// @ts-ignore
+const sdkConfig = initialize({ env: config.global.driftEnv });
 
 setLogLevel(config.global.debug ? 'debug' : 'info');
 
@@ -240,7 +278,6 @@ const runBot = async () => {
 	});
 
 	let bulkAccountLoader: BulkAccountLoader | undefined;
-	let lastBulkAccountLoaderSlot: number | undefined;
 	let accountSubscription: DriftClientSubscriptionConfig = {
 		type: 'websocket',
 	};
@@ -254,7 +291,6 @@ const runBot = async () => {
 			stateCommitment,
 			config.global.bulkAccountLoaderPollingInterval
 		);
-		lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
 		accountSubscription = {
 			type: 'polling',
 			accountLoader: bulkAccountLoader,
@@ -305,10 +341,6 @@ const runBot = async () => {
 	});
 
 	const slotSubscriber = new SlotSubscriber(connection, {});
-	const lastSlotReceivedMutex = new Mutex();
-	let lastSlotReceived: number;
-	let lastHealthCheckSlot = -1;
-	const startupTime = Date.now();
 
 	const lamportsBalance = await connection.getBalance(wallet.publicKey);
 	logger.info(
@@ -337,11 +369,6 @@ const runBot = async () => {
 
 	eventSubscriber.subscribe();
 	await slotSubscriber.subscribe();
-	slotSubscriber.eventEmitter.on('newSlot', async (slot: number) => {
-		await lastSlotReceivedMutex.runExclusive(async () => {
-			lastSlotReceived = slot;
-		});
-	});
 
 	if (!(await driftClient.getUser().exists())) {
 		logger.error(`User for ${wallet.publicKey} does not exist`);
@@ -371,6 +398,12 @@ const runBot = async () => {
 	);
 	await driftClient.fetchAccounts();
 	await driftClient.getUser().fetchAccounts();
+	await driftClient.forceGetPerpMarketAccount(0);
+	await driftClient.forceGetPerpMarketAccount(1);
+	await driftClient.forceGetPerpMarketAccount(2);
+	await driftClient.forceGetPerpMarketAccount(3);
+	await driftClient.forceGetSpotMarketAccount(0);
+	await driftClient.forceGetSpotMarketAccount(1);
 
 	printUserAccountStats(driftUser);
 	if (config.global.closeOpenPositions) {
@@ -556,23 +589,21 @@ const runBot = async () => {
 		);
 	}
 
-	if (configHasBot(config, 'liquidator')) {
-		bots.push(
-			new LiquidatorBot(
-				bulkAccountLoader,
-				driftClient,
-				{
-					rpcEndpoint: endpoint,
-					commit: commitHash,
-					driftEnv: config.global.driftEnv,
-					driftPid: driftPublicKey.toBase58(),
-					walletAuthority: wallet.publicKey.toBase58(),
-				},
-				config.botConfigs.liquidator,
-				config.global.subaccounts[0]
-			)
-		);
-	}
+	// Force jito liquidator bot creation
+	const liquidator = new LiquidatorBot(
+		bulkAccountLoader,
+		driftClient,
+		{
+			rpcEndpoint: endpoint,
+			commit: commitHash,
+			driftEnv: config.global.driftEnv,
+			driftPid: driftPublicKey.toBase58(),
+			walletAuthority: wallet.publicKey.toBase58(),
+		},
+		config.botConfigs.liquidator,
+		config.global.subaccounts[0]
+	);
+	bots.push(liquidator);
 	if (configHasBot(config, 'floatingMaker')) {
 		bots.push(
 			new FloatingPerpMakerBot(
@@ -614,95 +645,217 @@ const runBot = async () => {
 	logger.info(`initializing bots`);
 	await Promise.all(bots.map((bot) => bot.init()));
 
-	logger.info(`starting bots (runOnce: ${config.global.runOnce})`);
-	await Promise.all(
-		bots.map((bot) => bot.startIntervalLoop(bot.defaultIntervalMs))
+	logger.info(`starting liquidator bot`);
+
+	const blockEngineUrl = process.env.BLOCK_ENGINE_URL || '';
+	logger.info(`BLOCK_ENGINE_URL: ${blockEngineUrl}`);
+
+	const authKeypairPath = process.env.AUTH_KEYPAIR_PATH || '';
+	logger.info(`AUTH_KEYPAIR_PATH: ${authKeypairPath}`);
+	const decodedKey = new Uint8Array(
+		JSON.parse(Fs.readFileSync(authKeypairPath).toString()) as number[]
 	);
-	eventSubscriber.eventEmitter.on('newEvent', async (event) => {
-		Promise.all(bots.map((bot) => bot.trigger(event)));
-	});
+	const keypair = Keypair.fromSecretKey(decodedKey);
 
-	// start http server listening to /health endpoint using http package
-	http
-		.createServer(async (req, res) => {
-			if (req.url === '/health') {
-				if (config.global.testLiveness) {
-					if (Date.now() > startupTime + 60 * 1000) {
-						res.writeHead(500);
-						res.end('Testing liveness test fail');
-						return;
-					}
-				}
+	const _accounts = process.env.ACCOUNTS_OF_INTEREST || '';
+	logger.info(`ACCOUNTS_OF_INTEREST: ${_accounts}`);
+	const accounts = _accounts.split(',').map((acc) => new PublicKey(acc));
 
-				if (config.global.websocket) {
-					/* @ts-ignore */
-					if (!driftClient.connection._rpcWebSocketConnected) {
-						logger.error(`Connection rpc websocket disconnected`);
-						res.writeHead(500);
-						res.end(`Connection rpc websocket disconnected`);
-						return;
-					}
-				}
+	const c = searcherClient(blockEngineUrl, keypair);
 
-				// check if a slot was received recently
-				let healthySlotSubscriber = false;
-				await lastSlotReceivedMutex.runExclusive(async () => {
-					healthySlotSubscriber = lastSlotReceived > lastHealthCheckSlot;
-					logger.debug(
-						`Health check: lastSlotReceived: ${lastSlotReceived}, lastHealthCheckSlot: ${lastHealthCheckSlot}, healthySlot: ${healthySlotSubscriber}`
-					);
-					if (healthySlotSubscriber) {
-						lastHealthCheckSlot = lastSlotReceived;
-					}
-				});
-				if (!healthySlotSubscriber) {
-					res.writeHead(501);
-					logger.error(`SlotSubscriber is not healthy`);
-					res.end(`SlotSubscriber is not healthy`);
+	await onPendingTransactions(c, accounts, 5, keypair, connection, liquidator);
+	onBundleResult(c);
+
+	if (opts.runOnce) {
+		process.exit(0);
+	}
+}};
+
+
+function convertToI64(arr: Uint8Array): bigint {
+	const buffer = Buffer.from(arr);
+	return buffer.readBigInt64LE();
+}
+
+function convertToI32(arr: Uint8Array): number {
+	const buffer = Buffer.from(arr);
+	return buffer.readInt32LE();
+}
+
+// Flexible class that takes properties and imbues them
+// to the object instance
+class Assignable {
+	constructor(properties: { [x: string]: any }) {
+		Object.keys(properties).map((key) => {
+			return ((this as any)[key] = properties[key]);
+		});
+	}
+}
+
+class UpdatePrice extends Assignable {}
+
+export const onPendingTransactions = async (
+	client: SearcherClient,
+	oracleAccounts: PublicKey[],
+	bundleTransactionLimit: number,
+	keypair: Keypair,
+	conn: Connection,
+	liquidatorBot: LiquidatorBot
+): Promise<void> => {
+	// init drift client
+
+	/// Pyth oracle updates from Jito Mempool
+	try {
+		const _tipAccount = (await client.getTipAccounts())[
+			Math.floor(Math.random() * 9)
+		];
+		const tipAccount = new PublicKey(_tipAccount);
+		const pythProgramId = getPythProgramKeyForCluster('mainnet-beta');
+		// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L148 UpdPriceArgs
+		const updatePriceSchema = new Map([
+			[
+				UpdatePrice,
+				{
+					kind: 'struct',
+					fields: [
+						['version', 'u32'],
+						['command', [4]], // i32
+						['status', 'u32'],
+						['unused', 'u32'],
+						['price', [8]], // i64
+						['confidence', 'u64'],
+						['publishing_slot', 'u64'],
+					],
+				},
+			],
+		]);
+		logger.info('Listening for pyth account updates');
+		for await (const txs of client.accountUpdates(
+			oracleAccounts,
+			(e: Error) => {
+				throw e;
+			}
+		)) {
+			for (const tx of txs) {
+				let blockhash: string;
+				try {
+					const resp = await conn.getLatestBlockhash('processed');
+					blockhash = resp.blockhash;
+				} catch {
 					return;
 				}
 
-				if (bulkAccountLoader) {
-					// we expect health checks to happen at a rate slower than the BulkAccountLoader's polling frequency
-					if (
-						lastBulkAccountLoaderSlot &&
-						bulkAccountLoader.mostRecentSlot === lastBulkAccountLoaderSlot
-					) {
-						res.writeHead(502);
-						res.end(`bulkAccountLoader.mostRecentSlot is not healthy`);
-						logger.error(
-							`Health check failed due to stale bulkAccountLoader.mostRecentSlot`
+				if (tx.version == 0) {
+					logger.info(
+						'Skipping transaction version 0, not expected for pyth updates'
+					);
+				}
+
+				const decompiledMessage = TransactionMessage.decompile(tx.message);
+				const filteredInstructions = decompiledMessage.instructions.filter(
+					(instruction) => {
+						if (
+							!instruction.programId.equals(pythProgramId) ||
+							!oracleAccounts.includes(instruction.keys[1].pubkey) // Watch out for this line - comparison between pubkeys is weird
+						) {
+							return false;
+						}
+						let instructionArgs: any;
+						try {
+							instructionArgs = deserialize(
+								updatePriceSchema,
+								UpdatePrice,
+								instruction.data
+							);
+						} catch (error) {
+							// wrong instruction data format, skip
+							return false;
+						}
+						const command = convertToI32(instructionArgs.command);
+						// Only evaluate UpdPrice and UpdPriceNoError ix's
+						// https://github.com/pyth-network/pyth-client/blob/main/program/rust/src/instruction.rs#L22 OracleCommand
+						return command == 3 || command == 13;
+					}
+				);
+
+				const bundlePromises: Promise<Transaction[]>[] =
+					filteredInstructions.map(async (instruction) => {
+						const instructionArgs: any = deserialize(
+							updatePriceSchema,
+							UpdatePrice,
+							instruction.data
 						);
-						return;
-					}
-					lastBulkAccountLoaderSlot = bulkAccountLoader.mostRecentSlot;
-				}
+						const newPrice = convertToI64(instructionArgs.price);
+						const newPriceAsBN = new BN(newPrice.toString()).div(new BN(100));
 
-				// check all bots if they're live
-				for (const bot of bots) {
-					const healthCheck = await promiseTimeout(bot.healthCheck(), 1000);
-					if (!healthCheck) {
-						logger.error(`Health check failed for bot ${bot.name}`);
-						res.writeHead(503);
-						res.end(`Bot ${bot.name} is not healthy`);
-						return;
-					}
-				}
+						const oraclePubkey = instruction.keys[1].pubkey;
 
-				// liveness check passed
-				res.writeHead(200);
-				res.end('OK');
-			} else {
-				res.writeHead(404);
-				res.end('Not found');
+						try {
+							const bundleTxs = await liquidatorBot.tryLiquidate(
+								oraclePubkey,
+								newPriceAsBN
+							);
+
+							return bundleTxs;
+						} catch (e) {
+							console.log(e);
+							return [];
+						}
+					});
+
+				const bundles = await Promise.all(bundlePromises);
+				for (const bundleTxs of bundles) {
+					if (bundleTxs.length == 0) {
+						continue;
+					}
+					for (const bundleTx of bundleTxs) {
+						bundleTx.recentBlockhash = blockhash;
+						if (bundleTx.signature === null) {
+							// Sets fee payer as well
+							bundleTx.sign({
+								publicKey: keypair.publicKey,
+								secretKey: keypair.secretKey,
+							});
+						}
+					}
+					const sigBuffer =
+						tx.signatures[0] === null ? Buffer.from('') : tx.signatures[0];
+					logger.info(`backrunning tx ${encode(sigBuffer)}`);
+					const versionedBundleTxs = bundleTxs.map((bundleTx) => {
+						return new VersionedTransaction(
+							bundleTx.compileMessage(),
+							bundleTx.signatures.map((sig) => sig.signature)
+						);
+					});
+					versionedBundleTxs.unshift(tx);
+					const b = new Bundle(versionedBundleTxs, bundleTransactionLimit);
+					b.addTipTx(keypair, 100_000_000, tipAccount, blockhash);
+					client.sendBundle(b);
+				}
 			}
-		})
-		.listen(healthCheckPort);
-	logger.info(`Health check server listening on port ${healthCheckPort}`);
-
-	if (config.global.runOnce) {
-		process.exit(0);
+		}
+	} catch (e) {
+		logger.info(`error: ${e}`);
+		await onPendingTransactions(
+			client,
+			oracleAccounts,
+			bundleTransactionLimit,
+			keypair,
+			conn,
+			liquidatorBot
+		);
 	}
+};
+
+export const onBundleResult = (c: SearcherClient): void => {
+	c.onBundleResult(
+		(result) => {
+			logger.info(`received bundle result: ${result}`);
+		},
+		(e) => {
+			logger.error(`${e}`);
+		}
+	);
 };
 
 async function recursiveTryCatch(f: () => void) {
@@ -717,6 +870,6 @@ async function recursiveTryCatch(f: () => void) {
 		await sleep(15000);
 		await recursiveTryCatch(f);
 	}
-}
+};
 
 recursiveTryCatch(() => runBot());
